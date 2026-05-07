@@ -73,6 +73,10 @@ from .configuration_llama import LlamaConfig
 
 import torch
 
+
+
+
+
 class AdaptiveRoPECache:
     """ROPE参数缓存类:若空间不足,一开始容量成倍增长,后面线性增长"""
     def __init__(self, head_dim, device, dtype, initial_capacity=512, threshold=4096, linear_step=2048):
@@ -141,8 +145,8 @@ class AdaptiveRoPECache:
         self.seen_tokens = 0
 
 
-class LatentKVGroup:
-    """存储单组的LatenKV [B,HN,S,HD]"""
+class LatentKVMerge_MiniCaceh_X:
+    """MiniCaceh_X合并类"""
     def __init__(
             self,
             layer_num,
@@ -150,33 +154,31 @@ class LatentKVGroup:
             dtype,
             batch_size,
             hidden_dim,
+            layer_buffers,
+            layer_seen_tokens,
             config: LlamaConfig,
-            init_capacity = 512,
-            threshold=4096,
-            linear_step=1024,
-            merge_args = None
+            merge_args = None,
             ):
+        self.config = config
+
         # 记录张量基础信息
         self.layer_num = layer_num
         self.device = device
         self.dtype = dtype
         self.batch_size = batch_size
         self.hidden_dim = hidden_dim
-        self.is_merge = is_merge
 
-        # 记录增长信息
-        self.threshold = threshold
-        self.linear_step = linear_step
+        # 合并所需参数
+        self.merge_args = merge_args
 
-        
         size = [self.batch_size,0,self.hidden_dim]
         mask_size = [self.batch_size,0]
         outliner_size = [self.batch_size,0,self.hidden_dim]
         modulus_size = [self.batch_size,0]
 
         # 层缓存(concat追加)
-        self.layer_buffers = [torch.zeros(size=size,dtype=self.dtype, device=self.device) for _ in range(layer_num)]
-        self.layer_seen_tokens = [0 for _ in range(layer_num)]
+        self.layer_buffers = layer_buffers
+        self.layer_seen_tokens = layer_seen_tokens
 
         # 组缓存(concat追加)
         self.group_dv = torch.zeros(size=size,dtype=self.dtype, device=self.device)
@@ -184,37 +186,20 @@ class LatentKVGroup:
         self.group_mask = torch.zeros(size=mask_size, dtype=torch.bool, device=self.device)
         self.outliners = [torch.zeros(size=outliner_size,dtype=self.dtype, device=self.device) for _ in range(layer_num)]
         self.group_seen_tokens = 0
-        
-        # 合并所需参数
-        self.merge_step = merge_step
-
-    def update(self, idx, latentKV):
-        """更新层缓存,适时合并组缓存"""
-        # 记录层缓存
-        self.layer_buffers[idx] = torch.concat([self.layer_buffers[idx], latentKV], dim=1)
-        self.layer_seen_tokens[idx] = self.layer_buffers[idx].shape[1]
-
-        # 判断是否合并组缓存
-        if(self.is_merge and idx == self.layer_num-1):
-            self.merge()
-
-        # 返回完整的latentKV:
-        return self.get_latent_kv(idx)
-
 
     def merge(self):
         """合并层缓存,追加到组缓存"""
         # 从layer_buffers中拿取merge_step长度的latentKV（用一个while循环比较好）
         eps = 1e-6
 
-        while min(self.layer_seen_tokens) >= self.merge_step:
+        while min(self.layer_seen_tokens) >= self.merge_args["MiniCache_X_merge_step"]:
             # 取出当前合并步的窗口
             layer_chunks = []
             layer_modulus_chunks = []
             layer_unit_chunks = []
 
             for layer_idx in range(self.layer_num):
-                chunk = self.layer_buffers[layer_idx][:, :self.merge_step, :]
+                chunk = self.layer_buffers[layer_idx][:, :self.merge_args["MiniCache_X_merge_step"], :]
                 modulus = torch.linalg.norm(chunk, dim=-1).clamp_min(eps)
                 unit = chunk / modulus.unsqueeze(-1)
 
@@ -241,7 +226,7 @@ class LatentKVGroup:
             batch_index = torch.arange(self.batch_size, device=self.device)
             gather_index = outlier_pos.view(self.batch_size, 1, 1).expand(-1, 1, self.hidden_dim)
 
-            outlier_mask = torch.zeros((self.batch_size, self.merge_step), dtype=torch.bool, device=self.device)
+            outlier_mask = torch.zeros((self.batch_size, self.merge_args["MiniCache_X_merge_step"]), dtype=torch.bool, device=self.device)
             outlier_mask[batch_index, outlier_pos] = True
             self.group_mask = torch.concat([self.group_mask, outlier_mask], dim=1)
 
@@ -257,7 +242,7 @@ class LatentKVGroup:
                 self.outliners[layer_idx] = torch.concat([self.outliners[layer_idx], outlier_value.to(self.dtype)], dim=1)
 
                 # 已合并的前缀从层缓存中移除，剩余部分继续等待下一次merge
-                self.layer_buffers[layer_idx] = self.layer_buffers[layer_idx][:, self.merge_step:, :]
+                self.layer_buffers[layer_idx] = self.layer_buffers[layer_idx][:, self.merge_args["MiniCache_X_merge_step"]:, :]
                 self.layer_seen_tokens[layer_idx] = self.layer_buffers[layer_idx].shape[1]
 
             self.group_seen_tokens = self.group_dv.shape[1]
@@ -265,8 +250,8 @@ class LatentKVGroup:
         # 释放原来的张量 (避免存储一个过大的张量)
         for layer_idx in range(self.layer_num):
             self.layer_buffers[layer_idx] = self.layer_buffers[layer_idx].clone()
-
-    def unmerge(self, idx):
+    
+    def unmerge(self,idx):
         """解压组缓存"""
         if self.group_seen_tokens == 0:
             return torch.zeros((self.batch_size, 0, self.hidden_dim), dtype=self.dtype, device=self.device)
@@ -281,22 +266,122 @@ class LatentKVGroup:
             group_buffer[self.group_mask] = self.outliners[idx].reshape(-1, self.hidden_dim)
 
         return group_buffer
+    
+    def get_group_len(self):
+        return self.group_seen_tokens
+
+
+
+class LatentKVMerge_Mean:
+    """均值合并算法类"""
+    def init():...
+
+    def merge():...
+
+    def ummerge():...
+
+    def get_group_len():...
+
+class LatentKVGroup:
+    """存储单组的LatenKV [B,HN,S,HD]"""
+    def __init__(
+            self,
+            layer_num,
+            device,
+            dtype,
+            batch_size,
+            hidden_dim,
+            config: LlamaConfig,
+            init_capacity = 512,
+            threshold=4096,
+            linear_step=1024,
+            merge_args = None
+            ):
+        # 记录张量基础信息
+        self.layer_num = layer_num
+        self.device = device
+        self.dtype = dtype
+        self.batch_size = batch_size
+        self.hidden_dim = hidden_dim
+
+        # 记录增长信息
+        self.threshold = threshold
+        self.linear_step = linear_step
+
+        # 合并所需参数
+        self.merge_args = merge_args
+
+
+        size = [self.batch_size,0,self.hidden_dim]
+        mask_size = [self.batch_size,0]
+        outliner_size = [self.batch_size,0,self.hidden_dim]
+        modulus_size = [self.batch_size,0]
+
+        # 层缓存(concat追加)
+        self.layer_buffers = [torch.zeros(size=size,dtype=self.dtype, device=self.device) for _ in range(layer_num)]
+        self.layer_seen_tokens = [0 for _ in range(layer_num)]
+
+        # 合并算法类
+        if self.merge_args["merge_algorithm"] == "MiniCache_X":
+            self.Merger = LatentKVMerge_MiniCaceh_X(
+                layer_num = self.layer_num,
+                device = self.device,
+                dtype = self.device,
+                batch_size = self.batch_size,
+                hidden_dim = self.hidden_dim,
+                layer_buffers = self.layer_buffers,
+                layer_seen_tokens = self.layer_seen_tokens,
+                config = self.config,
+                merge_args = self.merge_args
+            )
+        elif self.merge_args["merge_algorithm"] == "Mean"
+            self.Merger = LatentKVMerge_Mean(
+                layer_num = self.layer_num,
+                device = self.device,
+                dtype = self.device,
+                batch_size = self.batch_size,
+                hidden_dim = self.hidden_dim,
+                layer_buffers = self.layer_buffers,
+                layer_seen_tokens = self.layer_seen_tokens,
+                config = self.config,
+                merge_args = self.merge_args
+            )
+        
+ 
+    def update(self, idx, latentKV):
+        """更新层缓存,适时合并组缓存"""
+        # 记录层缓存
+        self.layer_buffers[idx] = torch.concat([self.layer_buffers[idx], latentKV], dim=1)
+        self.layer_seen_tokens[idx] = self.layer_buffers[idx].shape[1]
+
+        # 判断是否合并组缓存
+        if(self.merge_args["is_merge"] and idx == self.layer_num-1):
+            self.merge()
+
+        # 返回完整的latentKV:
+        return self.get_latent_kv(idx)
+
+    def merge(self):
+        """合并层缓存,追加到组缓存"""
+        self.Merger.merge()
+
+    def unmerge(self, idx):
+        """解压组缓存"""
+        return self.Merger.unmerge(idx)
 
     def get_layer_len(self, idx):
         return self.layer_seen_tokens[idx]
 
     def get_group_len(self):
-        return self.group_seen_tokens
+        return self.Merger.get_group_len()
 
     def get_latent_kv(self, idx):
         """返回该层的lantentKV"""
-        if self.is_merge:
+        if self.merge_args["is_merge"]:
             return torch.concat([self.unmerge(idx), self.layer_buffers[idx]], dim=1)
         else:
             return self.layer_buffers[idx]
     
-
-
 class LatentKVCache:
     """存储潜在KV的类"""
     def __init__(
